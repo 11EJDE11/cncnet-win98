@@ -1,0 +1,119 @@
+From ff6a0ef350e9482a805b0a625db1827c20ac037d Mon Sep 17 00:00:00 2001
+From: 11EJDE11 <eliotj12@gmail.com>
+Date: Fri, 9 Oct 2026 15:43:46 +1300
+Subject: [PATCH] Re-encode relocated rel32 branches whose target is more than
+ 2 GB away
+
+A 32-bit rel32 wraps around the 4 GB address space, so any target is reachable,
+but Zydis range-checks the displacement in 64 bits and rejected targets more
+than 2 GB from the caller code. RebuildInstructions then copied the relative
+instruction verbatim, so it jumped to the wrong place. This happens on
+Windows 9x, where VirtualAllocEx memory for another process lies in the shared
+arena above 0x80000000 (268 such hooks for Ares + Phobos, and the game crashed).
+Adjust the target by 2^32 before encoding; the rel32 is the same modulo 2^32.
+Adds tests for far forward/backward branches.
+---
+ SyringeDebugger.cpp                | 23 +++++++++++++
+ tests/RebuildInstructionsTests.cpp | 52 ++++++++++++++++++++++++++++++
+ 2 files changed, 75 insertions(+)
+
+diff --git a/SyringeDebugger.cpp b/SyringeDebugger.cpp
+index 7348cbb..ea19e44 100644
+--- a/SyringeDebugger.cpp
++++ b/SyringeDebugger.cpp
+@@ -313,6 +313,29 @@ std::vector<BYTE> SyringeDebugger::RebuildInstructions(
+             }
+         }
+ 
++        // A 32-bit rel32 wraps around the 4 GB address space, so any target is reachable
++        // from any address - but the encoder range-checks the displacement in 64 bits and
++        // rejects targets more than 2 GB away. That happens whenever the caller code is
++        // allocated far from the hooked code (on Windows 9x, VirtualAllocEx memory for
++        // another process lives in the shared arena above 0x80000000). Move the target by
++        // 2^32 so the displacement is in range; the encoded rel32 is identical modulo 2^32.
++        for (ZyanU8 i = 0; i < req.operand_count; ++i)
++        {
++            if (req.operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
++            {
++                auto const distance = static_cast<ZyanI64>(req.operands[i].imm.u)
++                    - static_cast<ZyanI64>(dstAddr);
++                if (distance > 0x7FFFFFFFll)
++                {
++                    req.operands[i].imm.u -= 0x100000000ull;
++                }
++                else if (distance < -0x80000000ll)
++                {
++                    req.operands[i].imm.u += 0x100000000ull;
++                }
++            }
++        }
++
+         BYTE encoded[ZYDIS_MAX_INSTRUCTION_LENGTH];
+         ZyanUSize encodedLen = sizeof(encoded);
+ 
+diff --git a/tests/RebuildInstructionsTests.cpp b/tests/RebuildInstructionsTests.cpp
+index 3d834e1..996e5b8 100644
+--- a/tests/RebuildInstructionsTests.cpp
++++ b/tests/RebuildInstructionsTests.cpp
+@@ -627,6 +627,58 @@ TEST_CASE(short_jnz_forced_near)
+     CHECK(target == 0x00401016);
+ }
+ 
++// The caller code can be more than 2 GB away from the hook (on Windows 9x, memory that
++// VirtualAllocEx gives for another process lies in the shared arena above 0x80000000).
++// rel32 wraps modulo 2^32, so the branch must still be re-encoded, not copied verbatim.
++TEST_CASE(far_destination_jnz_wraps)
++{
++    // 75 14 at 0x00415087, relocated to the shared arena
++    BYTE bytes[] = { 0x75, 0x14 };
++    DWORD origAddr = 0x00415087;
++    DWORD newAddr  = 0x9CAB2000;
++
++    auto result = SyringeDebugger::RebuildInstructions(bytes, sizeof(bytes), origAddr, newAddr);
++
++    CHECK(result.size() == 6);
++    CHECK(decode_mnemonic(result.data(), result.size()) == ZYDIS_MNEMONIC_JNZ);
++
++    DWORD target = 0;
++    CHECK(decode_branch_target(result.data(), result.size(), newAddr, &target));
++    CHECK(target == 0x0041509D);
++}
++
++TEST_CASE(far_destination_call_wraps)
++{
++    // E8 rel32 at 0x00467950 calling 0x004F9A8E, relocated to the shared arena
++    BYTE bytes[] = { 0xE8, 0x39, 0x21, 0x09, 0x00 };
++    DWORD origAddr = 0x00467950;
++    DWORD newAddr  = 0x9CAB3010;
++
++    auto result = SyringeDebugger::RebuildInstructions(bytes, sizeof(bytes), origAddr, newAddr);
++
++    CHECK(result.size() == 5);
++    CHECK(decode_mnemonic(result.data(), result.size()) == ZYDIS_MNEMONIC_CALL);
++
++    DWORD target = 0;
++    CHECK(decode_branch_target(result.data(), result.size(), newAddr, &target));
++    CHECK(target == 0x004F9A8E);
++}
++
++TEST_CASE(far_destination_backwards_jmp_wraps)
++{
++    // E9 rel32 at 0x9CAB0000 jumping to 0x00401000 - the opposite direction
++    BYTE bytes[] = { 0xE9, 0xFB, 0x0F, 0x95, 0x63 };   // 0x9CAB0005 + 0x63950FFB = 0x00401000 (mod 2^32)
++    DWORD origAddr = 0x9CAB0000;
++    DWORD newAddr  = 0x9CAB5000;
++
++    auto result = SyringeDebugger::RebuildInstructions(bytes, sizeof(bytes), origAddr, newAddr);
++
++    CHECK(result.size() == 5);
++    DWORD target = 0;
++    CHECK(decode_branch_target(result.data(), result.size(), newAddr, &target));
++    CHECK(target == 0x00401000);
++}
++
+ // ---- entry point ----
+ 
+ int main()
+-- 
+2.41.0.windows.3
+

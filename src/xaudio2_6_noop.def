@@ -1,0 +1,4 @@
+LIBRARY XAudio2_6
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

@@ -1,0 +1,8 @@
+LIBRARY NTDTA
+EXPORTS
+  DbgBreakPoint
+  DbgPrintEx
+  DbgPrompt
+  NtQuerySystemInformation
+  RtlInitializeBitMap
+  RtlSetBits
